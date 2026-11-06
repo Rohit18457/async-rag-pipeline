@@ -99,8 +99,8 @@ RAG_Queue/
 
 ### 2. Clone the Repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/RAG_Queue.git
-cd RAG_Queue
+git clone https://github.com/Rohit18457/async-rag-pipeline.git
+cd async-rag-pipeline
 ```
 
 ---
@@ -254,3 +254,4 @@ RQ uses `os.fork()` by default, which is unsupported on Windows. This project pr
 ## 📜 License
 
 MIT License. Free to use and modify for educational and commercial projects.
+
