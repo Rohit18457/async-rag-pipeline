@@ -183,7 +183,49 @@ python run_worker.py
 
 ## 📡 API Reference
 
-### 1. Submit Query
+### 1. Upload Document (Asynchronous PDF Ingestion)
+Uploads and enqueues a PDF file for background parsing, chunking, and vector indexing into Qdrant.
+
+- **URL:** `/documents/upload`
+- **Method:** `POST`
+- **Status:** `202 Accepted`
+- **Content-Type:** `multipart/form-data`
+- **Query Parameters:** `collection_name` *(optional, defaults to `learning_rag`)*
+
+**cURL Example:**
+```bash
+curl -X POST "http://127.0.0.1:8000/documents/upload" \
+     -F "file=@sample.pdf"
+```
+
+**Response:**
+```json
+{
+  "status": "queued",
+  "job_id": "f891a27e-3b56-4271-97b1-289569cdbfb1",
+  "filename": "sample.pdf",
+  "message": "Document 'sample.pdf' queued for asynchronous indexing. Track progress via /job-status/f891a27e-3b56-4271-97b1-289569cdbfb1"
+}
+```
+
+**Track Ingestion Result (`GET /job-status/{job_id}`):**
+```json
+{
+  "job_id": "f891a27e-3b56-4271-97b1-289569cdbfb1",
+  "status": "finished",
+  "result": {
+    "status": "completed",
+    "filename": "sample.pdf",
+    "pages_processed": 25,
+    "chunks_indexed": 82,
+    "collection": "learning_rag"
+  }
+}
+```
+
+---
+
+### 2. Submit Query
 Enqueues a user query for asynchronous processing.
 
 - **URL:** `/chat`
@@ -207,8 +249,8 @@ Enqueues a user query for asynchronous processing.
 
 ---
 
-### 2. Poll Job Status / Retrieve Answer
-Fetches the processing state and final answer.
+### 3. Poll Job Status / Retrieve Results
+Fetches the processing state and output for any query or document ingestion job.
 
 - **URL:** `/job-status/{job_id}`
 - **Method:** `GET`
@@ -222,7 +264,7 @@ Fetches the processing state and final answer.
 }
 ```
 
-**Response (Finished):**
+**Response (Finished Query):**
 ```json
 {
   "job_id": "c3e98160-5a33-4f9e-97dc-3224f8d6899b",
@@ -233,7 +275,7 @@ Fetches the processing state and final answer.
 
 ---
 
-### 3. Health Check
+### 4. Health Check
 - **URL:** `/health`
 - **Method:** `GET`
 ```json

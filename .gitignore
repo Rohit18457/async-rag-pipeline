@@ -17,6 +17,9 @@ env/
 # Vector database storage & persistence (do not commit binary database files)
 qdrant_storage/
 
+# Temporary uploads directory
+uploads/
+
 # IDE & Editor settings
 .vscode/
 .idea/
@@ -26,4 +29,3 @@ qdrant_storage/
 # Operating System files
 .DS_Store
 Thumbs.db
-
