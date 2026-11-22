@@ -264,12 +264,34 @@ Fetches the processing state and output for any query or document ingestion job.
 }
 ```
 
-**Response (Finished Query):**
+**Response (Finished Query — Structured with Citations & Scores):**
 ```json
 {
   "job_id": "c3e98160-5a33-4f9e-97dc-3224f8d6899b",
   "status": "finished",
-  "result": "Based on the provided document (Page 12), Node.js includes several core modules..."
+  "result": {
+    "query": "What are the core modules in Node.js and their purposes?",
+    "answer": "Based on the provided document (Page 12), Node.js includes several core modules such as `fs` for file system operations, `http` for creating web servers, and `path` for handling file paths...",
+    "citations": [
+      {
+        "page": 12,
+        "filename": "sample.pdf",
+        "score": 0.8842,
+        "snippet": "Node.js core modules include fs, http, https, path, and os. The fs module allows interacting with the file system..."
+      },
+      {
+        "page": 14,
+        "filename": "sample.pdf",
+        "score": 0.8125,
+        "snippet": "The http module provides facilities for HTTP transfer protocols and launching high-performance servers..."
+      }
+    ],
+    "metrics": {
+      "retrieval_ms": 28.45,
+      "generation_ms": 312.18,
+      "total_ms": 340.63
+    }
+  }
 }
 ```
 

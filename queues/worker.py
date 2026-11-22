@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
@@ -44,34 +45,69 @@ client = Groq(api_key=api_key)
 
 
 # =============================================================================
-# 1. Background Query Synthesis Task
+# 1. Background Query Synthesis Task (Structured Response + Citations & Scores)
 # =============================================================================
 
-def process_query(query: str, collection_name: str = None) -> str:
+def process_query(query: str, collection_name: str = None) -> dict:
     """
-    Worker task: retrieves relevant context from Qdrant vector database
-    and synthesizes an answer using Groq LLM.
+    Worker task: retrieves relevant context with similarity scores from Qdrant,
+    synthesizes an answer using Groq LLM, and returns structured output
+    including citations, similarity scores, and execution latency metrics.
     """
     print(f"\n🔍 [Worker Query] Processing: '{query}'")
 
+    # 1. Measure Retrieval Latency & Similarity Search with Scores
+    start_retrieval = time.perf_counter()
     try:
         db = get_vector_db(collection_name=collection_name)
-        search_results = db.similarity_search(
+        search_results = db.similarity_search_with_score(
             query=query,
             k=4
         )
+        retrieval_ms = (time.perf_counter() - start_retrieval) * 1000
     except Exception as e:
         error_msg = f"Failed to retrieve context from Qdrant: {e}"
         print(f"❌ {error_msg}")
-        return error_msg
+        return {
+            "query": query,
+            "answer": error_msg,
+            "citations": [],
+            "status": "error"
+        }
 
     if not search_results:
-        return "I cannot find any relevant context in the provided documents to answer your question."
+        return {
+            "query": query,
+            "answer": "I cannot find any relevant context in the provided documents to answer your question.",
+            "citations": [],
+            "metrics": {
+                "retrieval_ms": round(retrieval_ms, 2),
+                "generation_ms": 0.0,
+                "total_ms": round(retrieval_ms, 2)
+            }
+        }
 
-    context = "\n\n\n".join([
-        f"Page Content: {result.page_content}\nPage Number: {result.metadata.get('page', 0) + 1}\nFile Location: {result.metadata.get('source', '')}"
-        for result in search_results
-    ])
+    # 2. Extract structured citations with similarity scores
+    citations = []
+    context_blocks = []
+
+    for doc, score in search_results:
+        page_num = doc.metadata.get("page", 0) + 1
+        source_name = doc.metadata.get("filename") or os.path.basename(doc.metadata.get("source", "document.pdf"))
+        snippet = doc.page_content.strip()
+
+        citations.append({
+            "page": page_num,
+            "filename": source_name,
+            "score": round(float(score), 4),
+            "snippet": snippet[:200] + ("..." if len(snippet) > 200 else "")
+        })
+
+        context_blocks.append(
+            f"[Source: {source_name} | Page: {page_num} | Relevance Score: {round(float(score), 4)}]\n{snippet}"
+        )
+
+    context = "\n\n---\n\n".join(context_blocks)
 
     system_prompt = f"""
 You are a helpful AI Assistant who answers user queries based strictly on the available context retrieved from a PDF file.
@@ -82,6 +118,8 @@ Context:
 {context}
 """
 
+    # 3. Measure Generation Latency & Synthesize Answer
+    start_gen = time.perf_counter()
     try:
         response = client.chat.completions.create(
             model=GROQ_MODEL,
@@ -90,13 +128,32 @@ Context:
                 {"role": "user", "content": query}
             ]
         )
+        generation_ms = (time.perf_counter() - start_gen) * 1000
         answer = response.choices[0].message.content
-        print("✅ Query processed successfully.")
-        return answer
+        total_ms = retrieval_ms + generation_ms
+
+        print(f"✅ Query completed in {total_ms:.1f}ms (Retrieval: {retrieval_ms:.1f}ms, Generation: {generation_ms:.1f}ms).")
+
+        return {
+            "query": query,
+            "answer": answer,
+            "citations": citations,
+            "metrics": {
+                "retrieval_ms": round(retrieval_ms, 2),
+                "generation_ms": round(generation_ms, 2),
+                "total_ms": round(total_ms, 2)
+            }
+        }
+
     except Exception as e:
         error_msg = f"Error generating response from Groq: {e}"
         print(f"❌ {error_msg}")
-        return error_msg
+        return {
+            "query": query,
+            "answer": error_msg,
+            "citations": citations,
+            "status": "error"
+        }
 
 
 # =============================================================================

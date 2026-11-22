@@ -48,10 +48,30 @@ class UploadResponse(BaseModel):
     message: str
 
 
+class Citation(BaseModel):
+    page: int = Field(..., description="Document page number")
+    filename: str = Field(..., description="Source document file name")
+    score: float = Field(..., description="Semantic cosine similarity score")
+    snippet: str = Field(..., description="Extracted context snippet from the page")
+
+
+class QueryMetrics(BaseModel):
+    retrieval_ms: float = Field(..., description="Vector similarity search duration in milliseconds")
+    generation_ms: float = Field(..., description="LLM inference synthesis duration in milliseconds")
+    total_ms: float = Field(..., description="Total processing time in milliseconds")
+
+
+class QueryResult(BaseModel):
+    query: str
+    answer: str
+    citations: list[Citation]
+    metrics: QueryMetrics
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     status: str
-    result: Optional[Any] = None
+    result: Optional[Any] = Field(None, description="Result object (QueryResult for chat, ingestion metadata for uploads)")
 
 
 # =============================================================================
