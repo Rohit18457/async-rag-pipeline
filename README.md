@@ -297,13 +297,50 @@ Fetches the processing state and output for any query or document ingestion job.
 
 ---
 
-### 4. Health Check
+### 4. Health Check & Queue Depth
 - **URL:** `/health`
 - **Method:** `GET`
+
 ```json
 {
   "status": "healthy",
-  "redis_connected": true
+  "redis_connected": true,
+  "queue_depth": 0,
+  "failed_jobs_count": 0
+}
+```
+
+---
+
+### 5. Dead Letter Queue (DLQ) Management
+Jobs encountering transient network or API failures are automatically retried with **Exponential Backoff** (`interval=[5, 15, 30]` seconds). If all retries are exhausted, the job is quarantined in the Dead Letter Queue for inspection and manual requeueing.
+
+#### Inspect Failed Jobs:
+- **URL:** `/queue/failed-jobs`
+- **Method:** `GET`
+
+```json
+{
+  "failed_count": 1,
+  "failed_jobs": [
+    {
+      "job_id": "a90184b2-c11f-4982-b7e4-2395a129ef31",
+      "enqueued_at": "2026-11-22 11:45:10",
+      "ended_at": "2026-11-22 11:46:02",
+      "exc_info": "... GroqRateLimitError: Rate limit exceeded (429)"
+    }
+  ]
+}
+```
+
+#### Requeue / Retry a Failed Job:
+- **URL:** `/queue/failed-jobs/{job_id}/retry`
+- **Method:** `POST`
+
+```json
+{
+  "message": "Job 'a90184b2-c11f-4982-b7e4-2395a129ef31' successfully requeued from Dead Letter Queue to active queue.",
+  "status": "queued"
 }
 ```
 
