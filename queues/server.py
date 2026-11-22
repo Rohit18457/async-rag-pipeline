@@ -15,15 +15,15 @@ if BASE_DIR not in sys.path:
 load_dotenv()
 
 from client.rq_client import queue, redis_conn, failed_registry, Retry
-from queues.worker import process_query, ingest_document_task
+from queues.worker import process_query, ingest_document_task, invalidate_collection_cache
 
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = FastAPI(
     title="Asynchronous RAG API",
-    description="Scalable, distributed Retrieval-Augmented Generation API powered by FastAPI, Redis Queue (RQ) with Exponential Backoff Retries, Qdrant Vector DB, and Groq LLMs.",
-    version="1.2.0"
+    description="Scalable, distributed Retrieval-Augmented Generation API powered by FastAPI, Redis Queue (RQ) with Exponential Backoff Retries, Redis Exact-Match Query Cache, Qdrant Vector DB, and Groq LLMs.",
+    version="1.3.0"
 )
 
 
@@ -59,12 +59,14 @@ class QueryMetrics(BaseModel):
     retrieval_ms: float = Field(..., description="Vector similarity search duration in milliseconds")
     generation_ms: float = Field(..., description="LLM inference synthesis duration in milliseconds")
     total_ms: float = Field(..., description="Total processing time in milliseconds")
+    cache_hit: Optional[bool] = Field(False, description="Whether the query was served from the Redis cache")
 
 
 class QueryResult(BaseModel):
     query: str
     answer: str
     citations: List[Citation]
+    cached: bool = Field(False, description="Whether this response was served from the Redis Exact-Match Cache (<2ms)")
     metrics: QueryMetrics
 
 
@@ -87,6 +89,12 @@ class FailedJobsResponse(BaseModel):
     failed_jobs: List[FailedJobItem]
 
 
+class CacheStatsResponse(BaseModel):
+    cached_queries_count: int
+    ttl_seconds: int
+    sample_cache_keys: List[str]
+
+
 # =============================================================================
 # General & Health Endpoints
 # =============================================================================
@@ -96,12 +104,14 @@ def root():
     return {
         "status": "online",
         "service": "Asynchronous RAG API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "features": [
             "Async Query Processing",
             "Async PDF Ingestion",
+            "Structured Response with Citations & Scores",
             "Auto-Retries with Exponential Backoff",
-            "Dead Letter Queue (DLQ)"
+            "Dead Letter Queue (DLQ)",
+            "Redis Exact-Match Query Cache (<2ms hits)"
         ],
         "docs_url": "/docs"
     }
@@ -109,17 +119,20 @@ def root():
 
 @app.get('/health', tags=["General"])
 def health_check():
-    """Verify Redis connection and queue health."""
+    """Verify Redis connection, queue depth, and cache health."""
     try:
         redis_alive = redis_conn.ping()
+        cache_count = len(list(redis_conn.scan_iter(match="rag_cache:*", count=100)))
     except Exception:
         redis_alive = False
+        cache_count = 0
 
     return {
         "status": "healthy" if redis_alive else "degraded",
         "redis_connected": redis_alive,
         "queue_depth": len(queue),
-        "failed_jobs_count": len(failed_registry)
+        "failed_jobs_count": len(failed_registry),
+        "cached_queries_count": cache_count
     }
 
 
@@ -131,10 +144,10 @@ def health_check():
 def submit_chat_job(body: ChatRequest):
     """
     Enqueue a query to be processed asynchronously by the background RQ worker.
-    Configured with Automatic Exponential Backoff Retries (3 retries with 5s, 15s, 30s delays).
+    Configured with Automatic Exponential Backoff Retries (3 retries with 5s, 15s, 30s delays)
+    and Redis Exact-Match caching.
     """
     try:
-        # Enqueue with exponential backoff: 3 retries at 5s, 15s, 30s intervals
         job = queue.enqueue(
             process_query,
             body.query,
@@ -150,7 +163,7 @@ def submit_chat_job(body: ChatRequest):
 
 
 # =============================================================================
-# Asynchronous Document Ingestion (with Auto-Retries)
+# Asynchronous Document Ingestion (with Auto-Retries & Cache Invalidation)
 # =============================================================================
 
 @app.post(
@@ -167,6 +180,7 @@ def upload_document(
     Asynchronously upload and ingest a PDF document.
     - Saves uploaded file to disk.
     - Dispatches a background ingestion job to the Redis Queue (RQ) with automatic retries.
+    - Invalidates query cache on success so answers stay fresh.
     - Returns immediately with HTTP 202 and a `job_id`.
     - Check progress/results at `/job-status/{job_id}`.
     """
@@ -269,7 +283,7 @@ def list_failed_jobs():
                     job_id=job.id,
                     enqueued_at=str(job.enqueued_at) if job.enqueued_at else None,
                     ended_at=str(job.ended_at) if job.ended_at else None,
-                    exc_info=(job.exc_info or "")[-400:]  # last 400 chars of stack trace
+                    exc_info=(job.exc_info or "")[-400:]
                 )
             )
 
@@ -293,3 +307,40 @@ def retry_failed_job(job_id: str):
         "message": f"Job '{job_id}' successfully requeued from Dead Letter Queue to active queue.",
         "status": "queued"
     }
+
+
+# =============================================================================
+# Redis Exact-Match Query Cache Management
+# =============================================================================
+
+@app.get('/cache/stats', response_model=CacheStatsResponse, tags=["Cache Management"])
+def get_cache_stats():
+    """Inspect Redis Exact-Match Query Cache statistics, active keys, and configured TTL."""
+    try:
+        keys = [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in redis_conn.scan_iter(match="rag_cache:*", count=100)]
+    except Exception:
+        keys = []
+
+    ttl_val = int(os.getenv("CACHE_TTL", 3600))
+    return {
+        "cached_queries_count": len(keys),
+        "ttl_seconds": ttl_val,
+        "sample_cache_keys": keys[:10]
+    }
+
+
+@app.delete('/cache', tags=["Cache Management"])
+def flush_query_cache(collection_name: Optional[str] = Query(None, description="Optional collection name to flush (omit to flush all collections)")):
+    """Flush cached queries from Redis."""
+    if collection_name:
+        count = invalidate_collection_cache(collection_name)
+        msg = f"Flushed {count} cached queries for collection '{collection_name}'."
+    else:
+        try:
+            keys = list(redis_conn.scan_iter(match="rag_cache:*", count=100))
+            count = redis_conn.delete(*keys) if keys else 0
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to flush cache: {str(e)}")
+        msg = f"Flushed all {count} cached queries across all collections."
+
+    return {"message": msg, "cleared_keys_count": count}

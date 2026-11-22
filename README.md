@@ -346,6 +346,42 @@ Jobs encountering transient network or API failures are automatically retried wi
 
 ---
 
+### 6. Redis Exact-Match Query Cache
+Identical questions bypass vector similarity search and Groq LLM inference completely, returning cached responses in **`< 2ms`** with zero token costs.
+
+* **Cache Key:** Deterministic SHA-256 hash `rag_cache:{collection}:{hash}`.
+* **Configurable TTL:** Defaults to 3600 seconds (`CACHE_TTL=3600`).
+* **Auto-Invalidation:** When a new document is uploaded via `/documents/upload`, the cache for that collection is automatically flushed so answers reflect new data.
+
+#### Inspect Cache Statistics:
+- **URL:** `/cache/stats`
+- **Method:** `GET`
+
+```json
+{
+  "cached_queries_count": 14,
+  "ttl_seconds": 3600,
+  "sample_cache_keys": [
+    "rag_cache:learning_rag:8f4b23...",
+    "rag_cache:learning_rag:1a2c3d..."
+  ]
+}
+```
+
+#### Manually Flush Cache:
+- **URL:** `/cache`
+- **Method:** `DELETE`
+- **Query Parameters:** `collection_name` *(optional, omit to flush all collections)*
+
+```json
+{
+  "message": "Flushed all 14 cached queries across all collections.",
+  "cleared_keys_count": 14
+}
+```
+
+---
+
 ## 💡 Notes for Windows Users
 
 RQ uses `os.fork()` by default, which is unsupported on Windows. This project provides `run_worker.py`, which utilizes `rq.SimpleWorker` to ensure smooth execution on Windows without errors.

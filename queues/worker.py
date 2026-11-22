@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import hashlib
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
@@ -8,6 +10,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from groq import Groq
+from client.rq_client import redis_conn
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 load_dotenv()
@@ -17,6 +20,7 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "learning_rag")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+CACHE_TTL = int(os.getenv("CACHE_TTL", 3600))  # Default: 1 hour (3600 seconds)
 
 # Initialize local embedding model
 embedding_model = HuggingFaceEmbeddings(
@@ -45,21 +49,65 @@ client = Groq(api_key=api_key)
 
 
 # =============================================================================
-# 1. Background Query Synthesis Task (Structured Response + Citations & Scores)
+# Cache Management Helpers
+# =============================================================================
+
+def get_cache_key(query: str, collection_name: str) -> str:
+    """Generate deterministic SHA-256 hash key for a normalized query and collection."""
+    norm_query = query.strip().lower()
+    query_hash = hashlib.sha256(norm_query.encode("utf-8")).hexdigest()
+    return f"rag_cache:{collection_name}:{query_hash}"
+
+
+def invalidate_collection_cache(collection_name: str = None) -> int:
+    """Flush all cached query results for a specific collection (or all collections)."""
+    target = collection_name or COLLECTION_NAME
+    pattern = f"rag_cache:{target}:*"
+    try:
+        keys = list(redis_conn.scan_iter(match=pattern, count=100))
+        if keys:
+            return redis_conn.delete(*keys)
+    except Exception as e:
+        print(f"⚠️ Cache invalidation error: {e}")
+    return 0
+
+
+# =============================================================================
+# 1. Background Query Synthesis Task (with Redis Query Cache)
 # =============================================================================
 
 def process_query(query: str, collection_name: str = None) -> dict:
     """
-    Worker task: retrieves relevant context with similarity scores from Qdrant,
-    synthesizes an answer using Groq LLM, and returns structured output
-    including citations, similarity scores, and execution latency metrics.
+    Worker task:
+    1. Checks Redis Exact-Match Cache for immediate <2ms cache hit.
+    2. On cache miss: retrieves relevant context with similarity scores from Qdrant.
+    3. Synthesizes an answer using Groq LLM.
+    4. Caches the structured response in Redis with TTL.
     """
-    print(f"\n🔍 [Worker Query] Processing: '{query}'")
+    target_collection = collection_name or COLLECTION_NAME
+    cache_key = get_cache_key(query, target_collection)
 
-    # 1. Measure Retrieval Latency & Similarity Search with Scores
+    print(f"\n🔍 [Worker Query] Processing: '{query}' (Collection: {target_collection})")
+
+    # Step A: Check Redis Exact-Match Cache
+    try:
+        cached_raw = redis_conn.get(cache_key)
+        if cached_raw:
+            cached_data = json.loads(cached_raw)
+            cached_data["cached"] = True
+            cached_data["metrics"]["cache_hit"] = True
+            cached_data["metrics"]["retrieval_ms"] = 0.0
+            cached_data["metrics"]["generation_ms"] = 0.0
+            cached_data["metrics"]["total_ms"] = 1.0
+            print(f"⚡ [Cache Hit] Returning cached answer in <2ms! (Key: {cache_key})")
+            return cached_data
+    except Exception as e:
+        print(f"⚠️ Cache read warning: {e}")
+
+    # Step B: Cache Miss - Measure Retrieval Latency & Similarity Search with Scores
     start_retrieval = time.perf_counter()
     try:
-        db = get_vector_db(collection_name=collection_name)
+        db = get_vector_db(collection_name=target_collection)
         search_results = db.similarity_search_with_score(
             query=query,
             k=4
@@ -72,6 +120,7 @@ def process_query(query: str, collection_name: str = None) -> dict:
             "query": query,
             "answer": error_msg,
             "citations": [],
+            "cached": False,
             "status": "error"
         }
 
@@ -80,14 +129,16 @@ def process_query(query: str, collection_name: str = None) -> dict:
             "query": query,
             "answer": "I cannot find any relevant context in the provided documents to answer your question.",
             "citations": [],
+            "cached": False,
             "metrics": {
                 "retrieval_ms": round(retrieval_ms, 2),
                 "generation_ms": 0.0,
-                "total_ms": round(retrieval_ms, 2)
+                "total_ms": round(retrieval_ms, 2),
+                "cache_hit": False
             }
         }
 
-    # 2. Extract structured citations with similarity scores
+    # Step C: Extract structured citations with similarity scores
     citations = []
     context_blocks = []
 
@@ -118,7 +169,7 @@ Context:
 {context}
 """
 
-    # 3. Measure Generation Latency & Synthesize Answer
+    # Step D: Measure Generation Latency & Synthesize Answer
     start_gen = time.perf_counter()
     try:
         response = client.chat.completions.create(
@@ -134,16 +185,27 @@ Context:
 
         print(f"✅ Query completed in {total_ms:.1f}ms (Retrieval: {retrieval_ms:.1f}ms, Generation: {generation_ms:.1f}ms).")
 
-        return {
+        result = {
             "query": query,
             "answer": answer,
             "citations": citations,
+            "cached": False,
             "metrics": {
                 "retrieval_ms": round(retrieval_ms, 2),
                 "generation_ms": round(generation_ms, 2),
-                "total_ms": round(total_ms, 2)
+                "total_ms": round(total_ms, 2),
+                "cache_hit": False
             }
         }
+
+        # Step E: Store in Redis Exact-Match Cache
+        try:
+            redis_conn.setex(cache_key, CACHE_TTL, json.dumps(result))
+            print(f"💾 [Cache Store] Saved query result to Redis with TTL={CACHE_TTL}s.")
+        except Exception as e:
+            print(f"⚠️ Cache write warning: {e}")
+
+        return result
 
     except Exception as e:
         error_msg = f"Error generating response from Groq: {e}"
@@ -152,12 +214,13 @@ Context:
             "query": query,
             "answer": error_msg,
             "citations": citations,
+            "cached": False,
             "status": "error"
         }
 
 
 # =============================================================================
-# 2. Background Document Ingestion Task (Asynchronous PDF Ingestion)
+# 2. Background Document Ingestion Task (with Automatic Cache Invalidation)
 # =============================================================================
 
 def ingest_document_task(file_path: str, original_filename: str, collection_name: str = None) -> dict:
@@ -167,8 +230,8 @@ def ingest_document_task(file_path: str, original_filename: str, collection_name
     2. Splits it into semantic chunks with overlap.
     3. Computes vector embeddings using Hugging Face.
     4. Indexes chunks into Qdrant collection (creating if needed or appending).
-    5. Safely cleans up temporary upload file.
-    Returns structured metadata on the indexed document.
+    5. Invalidates stale query cache for the collection so answers stay fresh.
+    6. Safely cleans up temporary upload file.
     """
     target_collection = collection_name or COLLECTION_NAME
     path = Path(file_path)
@@ -226,7 +289,12 @@ def ingest_document_task(file_path: str, original_filename: str, collection_name
 
         print(f"✅ Ingestion successful: '{original_filename}' indexed into collection '{target_collection}'.")
 
-        # 4. Cleanup temporary uploaded file
+        # 4. Invalidate stale query cache for this collection
+        cleared_cache_keys = invalidate_collection_cache(target_collection)
+        if cleared_cache_keys > 0:
+            print(f"🧹 [Cache Invalidation] Cleared {cleared_cache_keys} cached query entries for '{target_collection}'.")
+
+        # 5. Cleanup temporary uploaded file
         try:
             if path.exists():
                 os.remove(path)
@@ -238,7 +306,8 @@ def ingest_document_task(file_path: str, original_filename: str, collection_name
             "filename": original_filename,
             "pages_processed": num_pages,
             "chunks_indexed": num_chunks,
-            "collection": target_collection
+            "collection": target_collection,
+            "cache_keys_invalidated": cleared_cache_keys
         }
 
     except Exception as e:
